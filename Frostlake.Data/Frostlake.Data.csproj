@@ -6,11 +6,28 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>Frostlake.Data</RootNamespace>
     <AssemblyName>Frostlake.Data</AssemblyName>
-    <Version>0.1.0</Version>
-    <Description>ADO.NET provider for Frostlake over its HTTP protocol</Description>
-    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
   </PropertyGroup>
+
+  <PropertyGroup Label="Package">
+    <PackageId>Frostlake.Data</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>MLorek</Authors>
+    <Description>ADO.NET provider for Frostlake over its HTTP protocol</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Frostlake-DB/frostlake-dotnet</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Frostlake-DB/frostlake-dotnet.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>frostlake;ado.net;dbprovider;sql;snowflake;database;driver</PackageTags>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="Frostlake.Data.Tests" />
