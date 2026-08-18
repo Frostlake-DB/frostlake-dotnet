@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Frostlake.Data</RootNamespace>
+    <AssemblyName>Frostlake.Data</AssemblyName>
+    <Version>0.1.0</Version>
+    <Description>ADO.NET provider for Frostlake over its HTTP protocol</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Frostlake.Data.Tests" />
+  </ItemGroup>
+
+</Project>
