@@ -256,6 +256,42 @@ public class ReaderTests
     }
 
     [Fact]
+    public void ZonedTimestampsReadAsDateTimeOffsetAtTheirOwnOffset()
+    {
+        using var tz = TestWire.Column("TIMESTAMP_TZ", """[["2026-01-02 03:04:05.123456789 +0200"]]""");
+        Assert.Equal(typeof(DateTimeOffset), tz.GetFieldType(0));
+        var value = Assert.IsType<DateTimeOffset>(tz.GetValue(0));
+        // DateTimeOffset equality compares instants only, so the offset is checked on its own
+        Assert.Equal(new DateTimeOffset(2026, 1, 2, 3, 4, 5, TimeSpan.FromHours(2)).AddTicks(1234567), value);
+        Assert.Equal(TimeSpan.FromHours(2), value.Offset);
+        Assert.Equal(value, tz.GetFieldValue<DateTimeOffset>(0));
+        Assert.Throws<FrostlakeException>(() => tz.GetDateTime(0));
+
+        using var negative = TestWire.Column("TIMESTAMP_TZ", """[["2026-01-02 03:04:05.000 -0530"]]""");
+        Assert.Equal(new TimeSpan(-5, -30, 0), negative.GetFieldValue<DateTimeOffset>(0).Offset);
+
+        // an LTZ arrives at the session zone's offset; GetDateTime reads its wall clock there
+        using var ltz = TestWire.Column("TIMESTAMP_LTZ", """[["2026-07-02 03:04:05.500 -0400"]]""");
+        Assert.Equal(typeof(DateTimeOffset), ltz.GetFieldType(0));
+        var local = ltz.GetFieldValue<DateTimeOffset>(0);
+        Assert.Equal(new DateTimeOffset(2026, 7, 2, 3, 4, 5, 500, TimeSpan.FromHours(-4)), local);
+        Assert.Equal(TimeSpan.FromHours(-4), local.Offset);
+        var wallClock = ltz.GetDateTime(0);
+        Assert.Equal(new DateTime(2026, 7, 2, 3, 4, 5, 500), wallClock);
+        Assert.Equal(DateTimeKind.Local, wallClock.Kind);
+    }
+
+    [Fact]
+    public void AZonedTimestampDotNetCannotHoldReadsAsText()
+    {
+        // DateTimeOffset stops at year 1 in UTC, so this instant has no .NET value
+        using var early = TestWire.Column("TIMESTAMP_TZ", """[["0001-01-01 00:00:00.000 +0100"]]""");
+        Assert.Equal(typeof(string), early.GetFieldType(0));
+        Assert.Equal("0001-01-01 00:00:00.000 +0100", early.GetValue(0));
+        Assert.Throws<FrostlakeException>(() => early.GetDateTime(0));
+    }
+
+    [Fact]
     public void BinaryColumnsDecodeHexAndFallBackToText()
     {
         using var binary = TestWire.Column("BINARY", """[["CAFE"]]""");
@@ -278,10 +314,47 @@ public class ReaderTests
     [Fact]
     public void RecordsAffectedSumsTheDmlCounts()
     {
+        // UPDATE always carries the "multi-joined" second column; it is not a
+        // "number of rows …" column and must stay out of the sum.
         using var reader = TestWire.Reader(
             """{"columns":[{"name":"number of rows inserted","dataType":"NUMBER"}],"rows":[[2]]}""",
-            """{"columns":[{"name":"number of rows updated","dataType":"NUMBER"}],"rows":[[3]]}""");
+            """
+            {"columns":[{"name":"number of rows updated","dataType":"NUMBER"},
+                        {"name":"number of multi-joined rows updated","dataType":"NUMBER"}],
+             "rows":[[3,7]]}
+            """);
         Assert.Equal(5, reader.RecordsAffected);
+    }
+
+    [Fact]
+    public void MergeCountsSumAcrossTheActionColumns()
+    {
+        using var reader = TestWire.Reader(
+            """
+            {"columns":[{"name":"number of rows inserted","dataType":"NUMBER"},
+                        {"name":"number of rows updated","dataType":"NUMBER"},
+                        {"name":"number of rows deleted","dataType":"NUMBER"}],
+             "rows":[[2,3,1]]}
+            """);
+        Assert.Equal(6, reader.RecordsAffected);
+    }
+
+    [Fact]
+    public void OrdinaryResultsDoNotLookLikeDmlCounts()
+    {
+        // A one-row SELECT is not a DML count, a multi-row one even less so, and a
+        // count-named column carrying text must be ignored rather than throw.
+        using var select = TestWire.Reader(
+            """{"columns":[{"name":"N","dataType":"NUMBER"}],"rows":[[5]]}""");
+        Assert.Equal(-1, select.RecordsAffected);
+
+        using var multiRow = TestWire.Reader(
+            """{"columns":[{"name":"number of rows inserted","dataType":"NUMBER"}],"rows":[[1],[2]]}""");
+        Assert.Equal(-1, multiRow.RecordsAffected);
+
+        using var textual = TestWire.Reader(
+            """{"columns":[{"name":"number of rows inserted","dataType":"VARCHAR"}],"rows":[["many"]]}""");
+        Assert.Equal(-1, textual.RecordsAffected);
     }
 
     [Fact]
@@ -315,5 +388,31 @@ public class ReaderTests
             seen++;
         }
         Assert.Equal(2, seen);
+    }
+
+    /// <summary>
+    /// A text or binary column reports its own length as ColumnSize; a number reports its precision;
+    /// a type with neither reports -1. The wire sends the length for text and binary only.
+    /// </summary>
+    [Fact]
+    public void ColumnSizeIsTheLengthForTextAndBinary()
+    {
+        using var reader = TestWire.Reader("""
+            {"columns":[{"name":"S","dataType":"VARCHAR","precision":0,"scale":0,"length":9},
+                        {"name":"B","dataType":"BINARY","precision":0,"scale":0,"length":5},
+                        {"name":"BIG","dataType":"VARCHAR","precision":0,"scale":0,"length":16777216},
+                        {"name":"N","dataType":"NUMBER","precision":10,"scale":2},
+                        {"name":"F","dataType":"FLOAT","precision":0,"scale":0}],
+             "rows":[["a","CAFE","b",1.5,2.5]]}
+            """);
+        var schema = reader.GetSchemaTable()!;
+        Assert.Equal(9, schema.Rows[0][SchemaTableColumn.ColumnSize]);
+        Assert.Equal(5, schema.Rows[1][SchemaTableColumn.ColumnSize]);
+        Assert.Equal(16777216, schema.Rows[2][SchemaTableColumn.ColumnSize]);
+        // A number is untouched: its precision still answers, and its scale with it.
+        Assert.Equal(10, schema.Rows[3][SchemaTableColumn.ColumnSize]);
+        Assert.Equal((short)2, schema.Rows[3][SchemaTableColumn.NumericScale]);
+        // Neither a length nor a precision: -1, ADO.NET's "not applicable".
+        Assert.Equal(-1, schema.Rows[4][SchemaTableColumn.ColumnSize]);
     }
 }

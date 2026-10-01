@@ -63,13 +63,13 @@ internal static class SqlSubstitution
                 i++;
             }
             else if ((ch == '@' || ch == ':')
-                     && !FollowsIdentifier(sql, i)
+                     && !FollowsOperand(sql, i)
                      && TryReadName(sql, i + 1, out var name, out var after)
                      && TryFindNamed(binds, name, out var bound))
             {
                 // Only substituted when a parameter of that name was supplied and the marker does
-                // not continue an identifier, so stage references (@my_stage), casts (v::date) and
-                // VARIANT paths (col:field) survive untouched.
+                // not directly follow an operand, so stage references (@my_stage), casts (v::date)
+                // and VARIANT paths (col:field, {'a':1}:a, ?:a) survive untouched.
                 output.Append(FormatLiteral(bound));
                 i = after - 1;
             }
@@ -107,15 +107,21 @@ internal static class SqlSubstitution
         return output.ToString();
     }
 
-    /// <summary>True when the marker continues an identifier, as in <c>v:field</c> or <c>v::date</c>.</summary>
-    private static bool FollowsIdentifier(string sql, int index)
+    /// <summary>
+    /// True when the marker directly follows the end of an operand: a name, a number or a
+    /// <c>$</c>variable, a closing bracket or brace, the closing quote of a literal or quoted
+    /// identifier, or a <c>?</c> placeholder. A colon there reads a path, as in <c>v:field</c>,
+    /// <c>f(x):a</c>, <c>{'a':1}:a</c>, <c>'…':a</c> or <c>?:a</c>.
+    /// </summary>
+    private static bool FollowsOperand(string sql, int index)
     {
         if (index == 0)
         {
             return false;
         }
         var previous = sql[index - 1];
-        return char.IsLetterOrDigit(previous) || previous is '_' or '$' or '"' or ')' or ']';
+        return char.IsLetterOrDigit(previous)
+            || previous is '_' or '$' or '"' or '\'' or ')' or ']' or '}' or '?';
     }
 
     private static int CopySpan(string sql, StringBuilder output, int start, int end)

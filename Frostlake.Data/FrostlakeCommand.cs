@@ -1,6 +1,7 @@
 using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
+using System.Text.Json;
 
 namespace Frostlake.Data;
 
@@ -14,6 +15,11 @@ public sealed class FrostlakeCommand : DbCommand
     private string _commandText = "";
     private int _commandTimeout;
 
+    /// <summary>
+    /// The SQL to run. It goes to the engine as it is, the empty text included, so an empty or blank
+    /// command is refused by the engine, with the account's own <c>Empty SQL statement.</c>, rather
+    /// than here in other words.
+    /// </summary>
     [AllowNull]
     public override string CommandText
     {
@@ -72,7 +78,7 @@ public sealed class FrostlakeCommand : DbCommand
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
     {
         var connection = Validate();
-        var response = connection.Execute(RenderSql(), CommandTimeout);
+        var response = connection.Execute(RenderSql(), CommandTimeout, _parameters.MultiStatementCount());
         return NewReader(response, connection, behavior);
     }
 
@@ -82,7 +88,7 @@ public sealed class FrostlakeCommand : DbCommand
     {
         var connection = Validate();
         var response = await connection
-            .ExecuteAsync(RenderSql(), CommandTimeout, cancellationToken)
+            .ExecuteAsync(RenderSql(), CommandTimeout, cancellationToken, _parameters.MultiStatementCount())
             .ConfigureAwait(false);
         return NewReader(response, connection, behavior);
     }
@@ -101,14 +107,14 @@ public sealed class FrostlakeCommand : DbCommand
     public override int ExecuteNonQuery()
     {
         var connection = Validate();
-        return DmlCount(connection.Execute(RenderSql(), CommandTimeout)) ?? -1;
+        return DmlCount(connection.Execute(RenderSql(), CommandTimeout, _parameters.MultiStatementCount())) ?? -1;
     }
 
     public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
     {
         var connection = Validate();
         var response = await connection
-            .ExecuteAsync(RenderSql(), CommandTimeout, cancellationToken)
+            .ExecuteAsync(RenderSql(), CommandTimeout, cancellationToken, _parameters.MultiStatementCount())
             .ConfigureAwait(false);
         return DmlCount(response) ?? -1;
     }
@@ -116,18 +122,19 @@ public sealed class FrostlakeCommand : DbCommand
     public override object? ExecuteScalar()
     {
         var connection = Validate();
-        return FirstCell(connection.Execute(RenderSql(), CommandTimeout));
+        return FirstCell(connection.Execute(RenderSql(), CommandTimeout, _parameters.MultiStatementCount()));
     }
 
     public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
     {
         var connection = Validate();
         var response = await connection
-            .ExecuteAsync(RenderSql(), CommandTimeout, cancellationToken)
+            .ExecuteAsync(RenderSql(), CommandTimeout, cancellationToken, _parameters.MultiStatementCount())
             .ConfigureAwait(false);
         return FirstCell(response);
     }
 
+    /// <summary>Null when there is no row to read; a NULL first cell is <see cref="DBNull.Value"/>, per ADO.NET convention.</summary>
     private object? FirstCell(SqlResponse response)
     {
         using var reader = new FrostlakeDataReader(response.ResultSets ?? new List<ResultSetDto>());
@@ -135,8 +142,7 @@ public sealed class FrostlakeCommand : DbCommand
         {
             return null;
         }
-        var value = reader.GetValue(0);
-        return value is DBNull ? null : value;
+        return reader.GetValue(0);
     }
 
     private FrostlakeConnection Validate()
@@ -144,10 +150,6 @@ public sealed class FrostlakeCommand : DbCommand
         if (DbConnection is not FrostlakeConnection connection)
         {
             throw new FrostlakeException("command has no FrostlakeConnection");
-        }
-        if (CommandText.Length == 0)
-        {
-            throw new FrostlakeException("CommandText is empty");
         }
         if (DbTransaction is not null && !ReferenceEquals(DbTransaction.Connection, connection))
         {
@@ -158,10 +160,18 @@ public sealed class FrostlakeCommand : DbCommand
 
     private string RenderSql()
     {
-        return _parameters.Count == 0 ? CommandText : SqlSubstitution.Substitute(CommandText, _parameters.Binds());
+        var binds = _parameters.Binds();
+        return binds.Count == 0 ? CommandText : SqlSubstitution.Substitute(CommandText, binds);
     }
 
-    /// <summary>DML answers with a one-cell "number of rows …" result; anything else has no update count.</summary>
+    /// <summary>
+    /// DML answers a single-row result whose count columns are named "number of rows …":
+    /// one column for INSERT/DELETE, but UPDATE always carries a second "number of
+    /// multi-joined rows updated" column and MERGE one column per action. The counts are
+    /// summed the way the engine's own JDBC driver sums them — every column whose name
+    /// starts with "number of rows", so the multi-joined column stays out. Anything else
+    /// (a SELECT, or a DDL status message) has no update count.
+    /// </summary>
     internal static int? DmlCount(SqlResponse response)
     {
         return response.ResultSets is { Count: > 0 } sets ? DmlCountOf(sets[0]) : null;
@@ -169,13 +179,21 @@ public sealed class FrostlakeCommand : DbCommand
 
     internal static int? DmlCountOf(ResultSetDto resultSet)
     {
-        if (resultSet is { Columns.Count: 1, Rows.Count: 1 }
-            && resultSet.Columns[0].Name.StartsWith("number of rows", StringComparison.OrdinalIgnoreCase)
-            && resultSet.Rows[0].Count > 0
-            && resultSet.Rows[0][0].TryGetInt32(out var count))
+        if (resultSet.Rows.Count != 1)
         {
-            return count;
+            return null;
         }
-        return null;
+        var row = resultSet.Rows[0];
+        long? total = null;
+        for (var i = 0; i < resultSet.Columns.Count && i < row.Count; i++)
+        {
+            if (resultSet.Columns[i].Name.StartsWith("number of rows", StringComparison.OrdinalIgnoreCase)
+                && row[i].ValueKind == JsonValueKind.Number
+                && row[i].TryGetInt64(out var count))
+            {
+                total = (total ?? 0) + count;
+            }
+        }
+        return total is null ? null : (int)Math.Min(total.Value, int.MaxValue);
     }
 }

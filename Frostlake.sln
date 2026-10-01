@@ -7,6 +7,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Frostlake.Data", "Frostlake
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Frostlake.Data.Tests", "Frostlake.Data.Tests\Frostlake.Data.Tests.csproj", "{4237B7F1-7A34-4F06-B52E-D45AEAB6B6CC}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Frostlake.Data.Testkit", "Frostlake.Data.Testkit\Frostlake.Data.Testkit.csproj", "{9B2A4C1A-A061-4472-A7FB-F0EC7203B0F8}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -24,5 +26,9 @@ Global
 		{4237B7F1-7A34-4F06-B52E-D45AEAB6B6CC}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{4237B7F1-7A34-4F06-B52E-D45AEAB6B6CC}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{4237B7F1-7A34-4F06-B52E-D45AEAB6B6CC}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9B2A4C1A-A061-4472-A7FB-F0EC7203B0F8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9B2A4C1A-A061-4472-A7FB-F0EC7203B0F8}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9B2A4C1A-A061-4472-A7FB-F0EC7203B0F8}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9B2A4C1A-A061-4472-A7FB-F0EC7203B0F8}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

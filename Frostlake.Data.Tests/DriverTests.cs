@@ -1,4 +1,6 @@
 using System.Data;
+using System.Globalization;
+using System.Text.Json;
 using Dapper;
 using Xunit;
 
@@ -82,6 +84,11 @@ public class DriverTests : IClassFixture<ServerFixture>
         using var empty = connection.CreateCommand();
         empty.CommandText = "SELECT b FROM t WHERE 1 = 0";
         Assert.Null(empty.ExecuteScalar());
+
+        // no rows is null; a NULL cell is DBNull — the ADO.NET distinction callers rely on
+        using var nullCell = connection.CreateCommand();
+        nullCell.CommandText = "SELECT b FROM t WHERE a = 1";
+        Assert.Equal(DBNull.Value, nullCell.ExecuteScalar());
 
         using var command = connection.CreateCommand();
         command.CommandText = "SELECT b FROM t ORDER BY a";
@@ -170,6 +177,25 @@ public class DriverTests : IClassFixture<ServerFixture>
     }
 
     [RequiresServerFact]
+    public void AnEmptyStatementIsRefusedByTheEngine()
+    {
+        using var connection = Open("net_empty_db");
+        var engineWords = EngineAtLeast(connection, 0, 1);
+        // The empty text reaches the engine like a blank one, rather than being turned away here
+        // with words of the provider's own.
+        foreach (var text in new[] { "", "   ", null })
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = text;
+            var error = Assert.Throws<FrostlakeException>(() => command.ExecuteNonQuery());
+            if (engineWords)
+            {
+                Assert.Contains("Empty SQL statement.", error.Message);
+            }
+        }
+    }
+
+    [RequiresServerFact]
     public void DateTimeRoundTrip()
     {
         using var connection = Open("net_ts_db");
@@ -182,6 +208,58 @@ public class DriverTests : IClassFixture<ServerFixture>
         using var reader = command.ExecuteReader();
         Assert.True(reader.Read());
         Assert.Equal(moment, reader.GetDateTime(0));
+    }
+
+    /// <summary>Whether the engine's <c>CURRENT_VERSION()</c> is at least <paramref name="major"/>.<paramref name="minor"/>.</summary>
+    private static bool EngineAtLeast(FrostlakeConnection connection, int major, int minor)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT CURRENT_VERSION()";
+        var parts = ((string)command.ExecuteScalar()!).Split('.', '-');
+        var version = (int.Parse(parts[0], CultureInfo.InvariantCulture), int.Parse(parts[1], CultureInfo.InvariantCulture));
+        return version.CompareTo((major, minor)) >= 0;
+    }
+
+    [RequiresServerFact]
+    public void ZonedTimestampsKeepTheirOffset()
+    {
+        using var connection = Open("net_tz_db");
+        var keepsOffsets = EngineAtLeast(connection, 0, 1);
+        Run(connection, "CREATE TABLE zoned (id INTEGER, tz TIMESTAMP_TZ)");
+        var moment = new DateTimeOffset(2026, 8, 13, 12, 34, 56, 789, TimeSpan.FromHours(2));
+        Run(connection, "INSERT INTO zoned VALUES (?, ?)", 1, moment);
+        Run(connection, "ALTER SESSION SET TIMEZONE = 'Asia/Kolkata'");
+        try
+        {
+            using var command = connection.CreateCommand();
+            // The LTZ is cast from the stored TZ rather than stored itself: a stored LTZ column
+            // reads back at the offset it was written with, which is the engine's to fix.
+            command.CommandText = "SELECT tz, tz::TIMESTAMP_LTZ FROM zoned WHERE id = 1";
+            using var reader = command.ExecuteReader();
+            Assert.True(reader.Read());
+            Assert.Equal(typeof(DateTimeOffset), reader.GetFieldType(0));
+            Assert.Equal(typeof(DateTimeOffset), reader.GetFieldType(1));
+            Assert.Throws<FrostlakeException>(() => reader.GetDateTime(0));
+            if (!keepsOffsets)
+            {
+                // engines before 0.1.0 relabel every zoned value in the server's own zone
+                return;
+            }
+            // the TZ keeps the offset it was written with ...
+            var tz = reader.GetFieldValue<DateTimeOffset>(0);
+            Assert.Equal(moment, tz);
+            Assert.Equal(TimeSpan.FromHours(2), tz.Offset);
+            // ... and the LTZ is the same instant in the session's zone, whatever this machine's is
+            var ltz = reader.GetFieldValue<DateTimeOffset>(1);
+            Assert.Equal(moment, ltz);
+            Assert.Equal(new TimeSpan(5, 30, 0), ltz.Offset);
+            Assert.Equal(new DateTime(2026, 8, 13, 16, 4, 56, 789), reader.GetDateTime(1));
+        }
+        finally
+        {
+            // the engine currently shares session parameters across sessions, so put it back
+            Run(connection, "ALTER SESSION UNSET TIMEZONE");
+        }
     }
 
     [RequiresServerFact]
@@ -260,21 +338,59 @@ public class DriverTests : IClassFixture<ServerFixture>
     }
 
     [RequiresServerFact]
-    public void DdlThroughExecuteReaderReportsAnEmptyResult()
+    public void DdlThroughExecuteReaderYieldsTheStatusResult()
     {
         using var connection = Open("net_ddlreader_db");
         using var command = connection.CreateCommand();
         command.CommandText = "CREATE TABLE z (a INTEGER)";
         using var reader = command.ExecuteReader();
-        Assert.Equal(0, reader.FieldCount);
-        Assert.False(reader.HasRows);
-        Assert.False(reader.Read());
+        if (reader.FieldCount == 0)
+        {
+            // engines before 0.1.0 answer DDL with no result set at all
+            Assert.False(reader.HasRows);
+            Assert.False(reader.Read());
+        }
+        else
+        {
+            // 0.1.0+ answers the Snowflake-style one-row status message
+            Assert.Equal(1, reader.FieldCount);
+            Assert.True(reader.Read());
+            Assert.Contains("successfully", reader.GetString(0), StringComparison.OrdinalIgnoreCase);
+            Assert.False(reader.Read());
+        }
+    }
+
+    [RequiresServerFact]
+    public void UpdateDeleteAndMergeReportTheirCounts()
+    {
+        using var connection = Open("net_counts_db");
+        Run(connection, "CREATE TABLE t (id INTEGER, v VARCHAR)");
+        Assert.Equal(3, Run(connection, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')"));
+        // UPDATE answers two columns (the second is "number of multi-joined rows updated");
+        // the count must still come through rather than the -1 of an unrecognised result.
+        Assert.Equal(2, Run(connection, "UPDATE t SET v = 'x' WHERE id <= 2"));
+        Assert.Equal(1, Run(connection, "DELETE FROM t WHERE id = 3"));
+
+        Run(connection, "CREATE TABLE src (id INTEGER, v VARCHAR)");
+        Assert.Equal(2, Run(connection, "INSERT INTO src VALUES (2, 'm'), (9, 'n')"));
+        var merged = Run(connection, """
+            MERGE INTO t USING src ON t.id = src.id
+            WHEN MATCHED THEN UPDATE SET t.v = src.v
+            WHEN NOT MATCHED THEN INSERT (id, v) VALUES (src.id, src.v)
+            """);
+        Assert.Equal(2, merged); // one updated + one inserted, summed across the MERGE columns
     }
 
     [RequiresServerFact]
     public void MultiStatementResponsesWalkWithNextResult()
     {
         using var connection = Open("net_multi_db");
+        // A request carrying more than one statement has to be asked for; 0 means any number.
+        using (var declare = connection.CreateCommand())
+        {
+            declare.CommandText = "ALTER SESSION SET MULTI_STATEMENT_COUNT = 0";
+            declare.ExecuteNonQuery();
+        }
         using var command = connection.CreateCommand();
         command.CommandText = "SELECT 1 AS a; SELECT 2 AS b;";
         using var reader = command.ExecuteReader();
@@ -295,6 +411,122 @@ public class DriverTests : IClassFixture<ServerFixture>
         command.CommandText = "SELECT SYSTEM$WAIT(10)";
         var error = Assert.Throws<FrostlakeException>(() => command.ExecuteScalar());
         Assert.Contains("timed out", error.Message);
+    }
+
+    [RequiresServerFact]
+    public void ClosingReleasesTheSessionAndRollsBackItsTransaction()
+    {
+        using var probe = Open("net_release_db");
+        Skip.IfNot(EngineAtLeast(probe, 0, 1), "engines before 0.1.0 have no endpoint to release a session with");
+        Run(probe, "CREATE TABLE acc (n INTEGER)");
+        var sessions = ActiveSessions();
+        var transactions = RowsOf(probe, "SHOW TRANSACTIONS");
+
+        using var connection = new FrostlakeConnection(ConnectionString);
+        connection.Open();
+        connection.ChangeDatabase("net_release_db");
+        // Begun in SQL, so the provider never saw it begin: closing must end it all the same.
+        Run(connection, "BEGIN");
+        Run(connection, "INSERT INTO acc VALUES (1)");
+        Assert.Equal(sessions + 1, ActiveSessions());
+        Assert.Equal(transactions + 1, RowsOf(probe, "SHOW TRANSACTIONS"));
+
+        connection.Close();
+        Assert.Equal(sessions, ActiveSessions());
+        Assert.Equal(transactions, RowsOf(probe, "SHOW TRANSACTIONS"));
+        Assert.Equal(0, RowsOf(probe, "SELECT n FROM acc"));
+    }
+
+    /// <summary>How many sessions the engine holds, as its <c>GET /api/sessions</c> counts them.</summary>
+    private int ActiveSessions()
+    {
+        var server = new Uri(ConnectionString);
+        using var http = new HttpClient();
+        var body = http.GetStringAsync($"http://{server.Host}:{server.Port}/api/sessions").GetAwaiter().GetResult();
+        using var document = JsonDocument.Parse(body);
+        return document.RootElement.GetProperty("activeSessions").GetInt32();
+    }
+
+    private static int RowsOf(FrostlakeConnection connection, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        using var reader = command.ExecuteReader();
+        var rows = 0;
+        while (reader.Read())
+        {
+            rows++;
+        }
+        return rows;
+    }
+
+    /// <summary>Releases a session behind its connection's back, as an idle expiry or a restart loses one.</summary>
+    private void Release(string sessionId)
+    {
+        var server = new Uri(ConnectionString);
+        using var http = new HttpClient();
+        using var response = http.Send(new HttpRequestMessage(
+            HttpMethod.Delete,
+            $"http://{server.Host}:{server.Port}/api/sessions/{Uri.EscapeDataString(sessionId)}"));
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+    }
+
+    private static object? Scalar(FrostlakeConnection connection, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return command.ExecuteScalar();
+    }
+
+    [RequiresServerFact]
+    public void ALostSessionIsReplacedOnTheConnectionStringsScope()
+    {
+        using var probe = Open("net_recover_db");
+        Skip.IfNot(EngineAtLeast(probe, 0, 1), "engines before 0.1.0 cannot refuse a session they no longer hold");
+        using var connection = new FrostlakeConnection(ConnectionString + "/NET_RECOVER_DB");
+        connection.Open();
+        var lost = connection.SessionId!;
+        Release(lost);
+
+        Assert.Equal("NET_RECOVER_DB", Scalar(connection, "SELECT CURRENT_DATABASE()"));
+        Assert.NotEqual(lost, connection.SessionId);
+    }
+
+    [RequiresServerFact]
+    public void ALostSessionWithATransactionOpenIsReportedAndNothingRuns()
+    {
+        using var probe = Open("net_lost_tx_db");
+        Skip.IfNot(EngineAtLeast(probe, 0, 1), "engines before 0.1.0 cannot refuse a session they no longer hold");
+        Run(probe, "CREATE TABLE acc (n INTEGER)");
+        using var connection = new FrostlakeConnection(ConnectionString + "/NET_LOST_TX_DB");
+        connection.Open();
+        Run(connection, "BEGIN");
+        Run(connection, "INSERT INTO acc VALUES (1)");
+        Release(connection.SessionId!);
+
+        var error = Assert.Throws<FrostlakeSessionLostException>(() => Run(connection, "INSERT INTO acc VALUES (2)"));
+        Assert.Contains("transaction", error.Message);
+        // The release rolled the first row back, and the second statement never ran.
+        Assert.Equal(0, RowsOf(probe, "SELECT n FROM acc"));
+        // The connection carries on, in a fresh session on its connection string's scope.
+        Assert.Equal(ConnectionState.Open, connection.State);
+        Assert.Equal("NET_LOST_TX_DB", Scalar(connection, "SELECT CURRENT_DATABASE()"));
+    }
+
+    [RequiresServerFact]
+    public void ALostSessionWhoseSchemaMovedIsReported()
+    {
+        using var probe = Open("net_lost_use_db");
+        Skip.IfNot(EngineAtLeast(probe, 0, 1), "engines before 0.1.0 cannot refuse a session they no longer hold");
+        Run(probe, "CREATE SCHEMA other");
+        using var connection = new FrostlakeConnection(ConnectionString + "/NET_LOST_USE_DB");
+        connection.Open();
+        Run(connection, "USE SCHEMA other");
+        Release(connection.SessionId!);
+
+        var error = Assert.Throws<FrostlakeSessionLostException>(() => Scalar(connection, "SELECT CURRENT_SCHEMA()"));
+        Assert.Contains("context", error.Message);
+        Assert.Equal("PUBLIC", Scalar(connection, "SELECT CURRENT_SCHEMA()"));
     }
 
     [RequiresServerFact]
@@ -395,5 +627,43 @@ public class DriverTests : IClassFixture<ServerFixture>
         table.Load(second);
         Assert.Equal(1, table.Rows.Count);
         Assert.Equal("Ada", table.Rows[0]["NAME"]);
+    }
+
+    /// <summary>
+    /// A command may ask for a pack itself, with no ALTER SESSION. The count rides on that one
+    /// command, so the session is left alone and the next unasked pack is still refused.
+    /// </summary>
+    [RequiresServerFact]
+    public void APackRunsOnTheCommandsOwnCount()
+    {
+        using var connection = Open("net_pack_db");
+        using (var packed = connection.CreateCommand())
+        {
+            packed.CommandText = "SELECT 1 AS a; SELECT 2 AS b";
+            packed.Parameters.AddWithValue("MULTI_STATEMENT_COUNT", 2);
+            using var reader = packed.ExecuteReader();
+            Assert.True(reader.Read());
+            Assert.Equal(1L, reader.GetInt64(0));
+            Assert.True(reader.NextResult());
+            Assert.True(reader.Read());
+            Assert.Equal(2L, reader.GetInt64(0));
+        }
+
+        using var unasked = connection.CreateCommand();
+        unasked.CommandText = "SELECT 1 AS a; SELECT 2 AS b";
+        FrostlakeException? refusal = null;
+        try
+        {
+            using var reader = unasked.ExecuteReader();
+        }
+        catch (FrostlakeException e)
+        {
+            refusal = e;
+        }
+        // Only an engine that counts a request's statements refuses one, and this driver supports
+        // older engines that run any pack they are sent. Against one of those there is no refusal
+        // to observe, so the check is skipped rather than passed.
+        Skip.If(refusal is null, "the engine does not enforce a statement count");
+        Assert.Contains("did not match the desired statement count", refusal!.Message);
     }
 }

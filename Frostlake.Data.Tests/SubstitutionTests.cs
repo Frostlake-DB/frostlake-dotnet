@@ -171,6 +171,40 @@ public class SubstitutionTests
     }
 
     [Fact]
+    public void PathAfterAnObjectConstantIsNotABind()
+    {
+        var binds = new[] { new BindValue("a", "nope") };
+        Assert.Equal("SELECT {'a':1}:a", SqlSubstitution.Substitute("SELECT {'a':1}:a", binds));
+    }
+
+    [Fact]
+    public void PathAfterAStringLiteralIsNotABind()
+    {
+        // The closing quote ends an operand, so the colon after it reads a path - or, inside an
+        // object constant, separates a key from its value.
+        var binds = new[] { new BindValue("a", "nope") };
+        Assert.Equal("SELECT '{\"a\":1}':a", SqlSubstitution.Substitute("SELECT '{\"a\":1}':a", binds));
+        Assert.Equal("SELECT {'k':a} FROM t", SqlSubstitution.Substitute("SELECT {'k':a} FROM t", binds));
+    }
+
+    [Fact]
+    public void PathAfterAPositionalPlaceholderIsNotABind()
+    {
+        var binds = new[] { new BindValue(null, "x"), new BindValue("a", "nope") };
+        Assert.Equal("SELECT 'x':a", SqlSubstitution.Substitute("SELECT ?:a", binds));
+    }
+
+    [Fact]
+    public void ASpacedMarkerAfterAnOperandStillBinds()
+    {
+        // Only a colon directly after the operand reads a path; a space before it opens a bind.
+        var binds = new[] { new BindValue(null, "x"), new BindValue("a", 5) };
+        Assert.Equal(
+            "SELECT v 5, {'k':1} 5, 'k' 5, 'x' 5",
+            SqlSubstitution.Substitute("SELECT v :a, {'k':1} :a, 'k' :a, ? :a", binds));
+    }
+
+    [Fact]
     public void NamedParametersThatMatchNothingAreStillFine()
     {
         // Every named parameter may go unused - a statement need not reference any of them.

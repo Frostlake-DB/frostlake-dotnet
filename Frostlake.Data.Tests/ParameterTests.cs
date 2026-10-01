@@ -161,4 +161,31 @@ public class ParameterTests
         Assert.Equal("boom", error.Message);
         Assert.NotNull(error.InnerException);
     }
+
+    /// <summary>
+    /// The statement count is a STATEMENT parameter: the command consumes it to say how many
+    /// statements it carries, and it is never bound into the SQL as a value.
+    /// </summary>
+    [Fact]
+    public void TheStatementCountIsConsumedRatherThanBound()
+    {
+        var parameters = new FrostlakeParameterCollection();
+        parameters.Add(new FrostlakeParameter { ParameterName = "id", Value = 7 });
+        Assert.Null(parameters.MultiStatementCount());
+        Assert.Single(parameters.Binds());
+
+        parameters.Add(new FrostlakeParameter { ParameterName = "MULTI_STATEMENT_COUNT", Value = 2 });
+        Assert.Equal(2, parameters.MultiStatementCount());
+        Assert.Single(parameters.Binds());
+    }
+
+    /// <summary>Zero is a real answer - any number - not nothing to say.</summary>
+    [Fact]
+    public void AZeroStatementCountIsStillDeclared()
+    {
+        var parameters = new FrostlakeParameterCollection();
+        parameters.Add(new FrostlakeParameter { ParameterName = "multi_statement_count", Value = 0 });
+        Assert.Equal(0, parameters.MultiStatementCount());
+        Assert.Empty(parameters.Binds());
+    }
 }

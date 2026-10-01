@@ -3,6 +3,7 @@ using System.Data;
 using System.Data.Common;
 using System.Globalization;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace Frostlake.Data;
 
@@ -14,9 +15,10 @@ namespace Frostlake.Data;
 /// <see cref="GetFieldType"/> always matches what <see cref="GetValue"/> returns for every
 /// row of that column. Integral NUMBER reads as <c>long</c>, widening to <c>decimal</c> and
 /// then to the exact text when a value in the column does not fit; scaled NUMBER →
-/// <c>decimal</c>, FLOAT → <c>double</c>, BOOLEAN → <c>bool</c>, DATE/TIMESTAMP →
-/// <c>DateTime</c>, TIME → <c>TimeSpan</c>, BINARY → <c>byte[]</c>, everything else
-/// (including VARIANT/OBJECT/ARRAY as their JSON text) → <c>string</c>.
+/// <c>decimal</c>, FLOAT → <c>double</c>, BOOLEAN → <c>bool</c>, DATE/TIMESTAMP_NTZ →
+/// <c>DateTime</c>, TIMESTAMP_TZ/TIMESTAMP_LTZ → <c>DateTimeOffset</c>, TIME →
+/// <c>TimeSpan</c>, BINARY → <c>byte[]</c>, everything else (including
+/// VARIANT/OBJECT/ARRAY as their JSON text) → <c>string</c>.
 /// </para>
 /// </summary>
 public sealed class FrostlakeDataReader : DbDataReader
@@ -185,7 +187,10 @@ public sealed class FrostlakeDataReader : DbDataReader
             var row = schema.NewRow();
             row[SchemaTableColumn.ColumnName] = column.Name;
             row[SchemaTableColumn.ColumnOrdinal] = i;
-            row[SchemaTableColumn.ColumnSize] = column.Precision is > 0 ? column.Precision.Value : -1;
+            // A text or binary column reports its own length; a number reports its precision; a type
+            // with neither reports -1, which is how ADO.NET spells "not applicable".
+            row[SchemaTableColumn.ColumnSize] = column.Length is > 0 ? column.Length.Value
+                : column.Precision is > 0 ? column.Precision.Value : -1;
             row[SchemaTableColumn.NumericPrecision] = (short)(column.Precision ?? 0);
             row[SchemaTableColumn.NumericScale] = (short)(column.Scale ?? 0);
             row[SchemaTableColumn.DataType] = ColumnType(i);
@@ -238,6 +243,11 @@ public sealed class FrostlakeDataReader : DbDataReader
         {
             ParseDateTime(AsText(cell), out var dateTime);
             return dateTime;
+        }
+        if (type == typeof(DateTimeOffset))
+        {
+            ParseDateTimeOffset(AsText(cell), out var zoned);
+            return zoned;
         }
         if (type == typeof(TimeSpan))
         {
@@ -328,13 +338,24 @@ public sealed class FrostlakeDataReader : DbDataReader
         return Math.Max(0, Math.Min(count, bufferLength - bufferOffset));
     }
 
+    /// <summary>
+    /// Reads a DATE or TIMESTAMP_NTZ as it is. The zoned timestamps behave as in Snowflake's own
+    /// connector: a TIMESTAMP_LTZ reads as its wall-clock time in the session's time zone,
+    /// marked <see cref="DateTimeKind.Local"/>, and a TIMESTAMP_TZ is refused, because a
+    /// <see cref="DateTime"/> cannot keep its offset — <see cref="GetValue"/> answers both as
+    /// <see cref="DateTimeOffset"/>.
+    /// </summary>
     public override DateTime GetDateTime(int ordinal)
     {
         var value = GetValue(ordinal);
+        var column = Column(ordinal);
         return value switch
         {
             DateTime dateTime => dateTime,
-            string text when ParseDateTime(text, out var parsed) => parsed,
+            DateTimeOffset zoned when IsLocalTimeZone(column) => DateTime.SpecifyKind(zoned.DateTime, DateTimeKind.Local),
+            DateTimeOffset => throw new FrostlakeException(
+                $"a {GetDataTypeName(ordinal)} keeps an offset that a DateTime would lose; read it as DateTimeOffset"),
+            string text when TypeFamily(column) != Family.ZonedTimestamp && ParseDateTime(text, out var parsed) => parsed,
             _ => throw new FrostlakeException($"cannot read {value.GetType().Name} as DateTime"),
         };
     }
@@ -504,6 +525,15 @@ public sealed class FrostlakeDataReader : DbDataReader
                     }
                 }
                 return typeof(DateTime);
+            case Family.ZonedTimestamp:
+                foreach (var cell in Cells(set, ordinal))
+                {
+                    if (!ParseDateTimeOffset(AsText(cell), out _))
+                    {
+                        return typeof(string);
+                    }
+                }
+                return typeof(DateTimeOffset);
             case Family.Time:
                 foreach (var cell in Cells(set, ordinal))
                 {
@@ -579,6 +609,39 @@ public sealed class FrostlakeDataReader : DbDataReader
             out result);
     }
 
+    /// <summary>
+    /// Reads a zoned timestamp at the offset it was written with: the engine sends its
+    /// wall-clock date and time, a space and the offset as ±HHMM. <c>DateTime.TryParse</c>
+    /// would convert that into the client machine's own zone and drop the offset.
+    /// </summary>
+    private static bool ParseDateTimeOffset(string text, out DateTimeOffset result)
+    {
+        result = default;
+        var match = Regex.Match(
+            text,
+            "^(?<local>[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?) (?<sign>[+-])(?<hours>[0-9]{2}):?(?<minutes>[0-9]{2})$");
+        if (!match.Success || !ParseDateTime(match.Groups["local"].Value, out var local))
+        {
+            return false;
+        }
+        var offset = new TimeSpan(
+            int.Parse(match.Groups["hours"].Value, CultureInfo.InvariantCulture),
+            int.Parse(match.Groups["minutes"].Value, CultureInfo.InvariantCulture),
+            0);
+        try
+        {
+            result = new DateTimeOffset(
+                DateTime.SpecifyKind(local, DateTimeKind.Unspecified),
+                match.Groups["sign"].Value == "-" ? offset.Negate() : offset);
+            return true;
+        }
+        catch (ArgumentException)
+        {
+            // an offset beyond ±14:00, or an instant before year 1 or after 9999
+            return false;
+        }
+    }
+
     /// <summary>The engine emits up to nanosecond fractions; .NET parses at most 7 digits.</summary>
     private static string TrimFraction(string text, int maxDigits)
     {
@@ -629,15 +692,21 @@ public sealed class FrostlakeDataReader : DbDataReader
             case "DATETIME":
             case "TIMESTAMP":
             case "TIMESTAMP_NTZ":
+                return Family.Timestamp;
             case "TIMESTAMP_LTZ":
             case "TIMESTAMP_TZ":
-                return Family.Timestamp;
+                return Family.ZonedTimestamp;
             case "BINARY":
             case "VARBINARY":
                 return Family.Binary;
             default:
                 return Family.Text;
         }
+    }
+
+    private static bool IsLocalTimeZone(ColumnDto column)
+    {
+        return string.Equals(column.DataType, "TIMESTAMP_LTZ", StringComparison.OrdinalIgnoreCase);
     }
 
     private enum Family
@@ -649,6 +718,7 @@ public sealed class FrostlakeDataReader : DbDataReader
         Date,
         Time,
         Timestamp,
+        ZonedTimestamp,
         Binary,
         Text,
     }

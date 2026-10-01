@@ -8,6 +8,7 @@ public sealed class FrostlakeTransaction : DbTransaction
 {
     private readonly FrostlakeConnection _connection;
     private bool _completed;
+    private bool _lost;
 
     internal FrostlakeTransaction(FrostlakeConnection connection)
     {
@@ -28,8 +29,23 @@ public sealed class FrostlakeTransaction : DbTransaction
         Finish("ROLLBACK");
     }
 
+    /// <summary>
+    /// The engine session that held the transaction is gone, and the transaction with it: nothing it
+    /// did was committed. Disposing it sends nothing, and Commit or Rollback says so.
+    /// </summary>
+    internal void Lose()
+    {
+        _completed = true;
+        _lost = true;
+    }
+
     private void Finish(string statement)
     {
+        if (_lost)
+        {
+            throw new FrostlakeSessionLostException(
+                "this transaction went with the engine session that held it, and nothing it did was committed");
+        }
         if (_completed)
         {
             throw new FrostlakeException("this transaction has already completed");

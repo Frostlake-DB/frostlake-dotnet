@@ -1,5 +1,6 @@
 using System.Collections;
 using System.Data.Common;
+using System.Globalization;
 
 namespace Frostlake.Data;
 
@@ -136,14 +137,45 @@ public sealed class FrostlakeParameterCollection : DbParameterCollection
     /// The parameters as bind values. A name is kept for <c>@name</c>/<c>:name</c> lookup with any
     /// prefix stripped; an unnamed parameter binds positionally to the next <c>?</c>.
     /// </summary>
+    /// <summary>
+    /// The name of the statement parameter that says how many statements the command carries. It is
+    /// consumed by the command rather than bound into the SQL, as it is on the account's own provider.
+    /// </summary>
+    internal const string MultiStatementCountName = "MULTI_STATEMENT_COUNT";
+
     internal IReadOnlyList<BindValue> Binds()
     {
         var binds = new List<BindValue>(_parameters.Count);
         foreach (var parameter in _parameters)
         {
+            if (IsMultiStatementCount(parameter))
+            {
+                continue;
+            }
             binds.Add(new BindValue(NameOf(parameter), parameter.Value));
         }
         return binds;
+    }
+
+    /// <summary>
+    /// How many statements the command declares, or null when it declares none and the session's
+    /// MULTI_STATEMENT_COUNT answers for it. Zero means any number.
+    /// </summary>
+    internal int? MultiStatementCount()
+    {
+        foreach (var parameter in _parameters)
+        {
+            if (IsMultiStatementCount(parameter) && parameter.Value is not null)
+            {
+                return Convert.ToInt32(parameter.Value, CultureInfo.InvariantCulture);
+            }
+        }
+        return null;
+    }
+
+    private static bool IsMultiStatementCount(FrostlakeParameter parameter)
+    {
+        return string.Equals(NameOf(parameter), MultiStatementCountName, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string? NameOf(FrostlakeParameter parameter)
